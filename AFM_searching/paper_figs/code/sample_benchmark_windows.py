@@ -54,30 +54,48 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--N', type=int, required=True)
     ap.add_argument('--centers', default=','.join(map(str, BENCHMARKS)))
-    ap.add_argument('--example', action='store_true', help='N=1,3,5: dense short-T demonstration, step .125')
+    ap.add_argument('--example', action='store_true', help='Dense short-T demonstration instead of the 1-2-5 benchmark windows.')
     ap.add_argument('--example-max', type=float, default=60., help='Largest T in the dense example (default 60).')
+    ap.add_argument('--example-min', type=float, default=.25,
+                    help='Smallest T in the dense example (default .25). Cost per sample grows '
+                         'with T, so a long scan can be split into equal-cost [min,max] chunks '
+                         'run as separate parallel tasks and concatenated when plotting.')
+    ap.add_argument('--example-step', type=float, default=.125,
+                    help='Spacing of the dense example grid (default .125). The gradient '
+                         'oscillation period is ~4-7 for every N here, so .5 still gives '
+                         '8-13 samples per period at a quarter of the cost.')
     ap.add_argument('--Omega', type=float, default=1., help='Benchmark point (default: the study base point).')
     ap.add_argument('--Delta', type=float, default=2.6, help='Benchmark point (default: the study base point).')
+    ap.add_argument('--beta', type=float, default=.1, help='Nudge strength (default: the study base value).')
+    ap.add_argument('--cost', choices=('AM', 'AM2'), default='AM',
+                    help='Cost operator (default: AM, as in the original bias study).')
+    ap.add_argument('--allow-degenerate', action='store_true',
+                    help='Permit N=1 with --cost AM2, whose gradient is identically zero.')
     ap.add_argument('--outdir', type=Path, default=AFM / 'paper_figs/data/bias_benchmarks')
     ap.add_argument('--reuse-dir', type=Path, default=AFM / 'paper_figs/data/bias_refined')
     args = ap.parse_args()
-    if args.N not in (1, 3, 5, 7, 9) or (args.example and args.N not in (1, 3, 5)):
-        ap.error('Use the existing odd chains; dense examples are N=1,3,5 only.')
+    if args.N not in (1, 3, 5, 7, 9):
+        ap.error('Use the existing odd chains.')
     if not np.isfinite(args.example_max) or args.example_max < .25:
         ap.error('--example-max must be finite and at least .25')
+    if args.cost == 'AM2' and args.N == 1 and not args.allow_degenerate:
+        # AM = sigma^z for a single atom, so AM^2 = identity: <AM^2> = 1 in every
+        # state, the loss is constant, and the gradient is identically zero.
+        ap.error('N=1 with --cost AM2 has an identically zero gradient (AM^2 = 1). '
+                 'Pass --allow-degenerate to record it anyway (round-off only).')
     import afmqep as A
     import dynamiqs as dq
     from afmqep.normalized_ae import NormalizedAE
     assert A.X64
-    physics = dict(N=args.N, Omega=args.Omega, Delta=args.Delta, beta=.1, target=1., cost='AM',
+    physics = dict(N=args.N, Omega=args.Omega, Delta=args.Delta, beta=args.beta, target=1., cost=args.cost,
                    rtol=1e-10, atol=1e-12, solver='Dopri8', normalized=True,
                    norm_tolerance=1e-5)
-    qm = A.Ising_Chain(args.N, T=1., dt=.1)
+    qm = (A.Ising_Chain if args.cost == 'AM' else A.Ising_Chain_AM2)(args.N, T=1., dt=.1)
     params = qm.set_params(args.Omega, args.Delta)
-    ged = np.array(A.make_grad_methods(.1)['ED'](params, qm, 1.)[1][:2], float)
+    ged = np.array(A.make_grad_methods(args.beta)['ED'](params, qm, 1.)[1][:2], float)
     method = dq.method.Dopri8(rtol=1e-10, atol=1e-12, max_steps=4_000_000)
-    estimators = {s: NormalizedAE(.1, s, method) for s in SCHEDULES}
-    tight = {s: NormalizedAE(.1, s, dq.method.Dopri8(
+    estimators = {s: NormalizedAE(args.beta, s, method) for s in SCHEDULES}
+    tight = {s: NormalizedAE(args.beta, s, dq.method.Dopri8(
         rtol=1e-12, atol=1e-14, max_steps=4_000_000)) for s in SCHEDULES}
     args.outdir.mkdir(parents=True, exist_ok=True)
     cache = {s: {} for s in SCHEDULES}
@@ -102,11 +120,16 @@ def main():
         tag = 'example' if center is None else f'T{center:g}'
         if center is None and args.example_max != 60.:
             tag += f'_T{args.example_max:g}'
+            if args.example_step != .125:
+                tag += f'_s{args.example_step:g}'
+            if args.example_min != .25:
+                tag += f'_from{args.example_min:g}'
         path = args.outdir / f'benchmark_chain_N{args.N}_{tag}.npz'
         config = dict(physics, benchmark=center, example=center is None,
                       grid='centered_min20_0.8T', sampling_threshold=.05, max_level=1)
         if center is None and args.example_max != 60.:
-            config.update(grid='dense_example', example_max=args.example_max, example_step=.125)
+            config.update(grid='dense_example', example_max=args.example_max,
+                          example_step=args.example_step, example_min=args.example_min)
         if path.exists():
             with np.load(path, allow_pickle=False) as previous:
                 assert json.loads(str(previous['meta'])) == config, 'Different configuration; use a new directory.'
@@ -115,7 +138,8 @@ def main():
                     continue
         result = None
         for level in (0, 1):
-            TL = np.arange(.25, args.example_max + 1e-9, .125) if center is None else benchmark_grid(center, level)
+            TL = (np.arange(args.example_min, args.example_max + 1e-9, args.example_step)
+                  if center is None else benchmark_grid(center, level))
             result = dict(TL=TL, g_ED=ged, meta=json.dumps(config), level=level, complete=False)
             for s in SCHEDULES:
                 result[f'g_{s}_AE'] = np.full((len(TL), 2), np.nan)
